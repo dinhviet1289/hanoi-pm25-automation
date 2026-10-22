@@ -1,0 +1,16 @@
+{
+  "name": "Hanoi PM2.5 GitHub Actions + Google Drive (Apps Script bridge)",
+  "storage": "Google Drive folder and Google Sheets",
+  "compute": "GitHub Actions runner",
+  "requires_manual_google_cloud_console_setup": false,
+  "authentication": "Google Apps Script Web App executed as the deployer; shared secret in Script Properties and GitHub Secrets",
+  "files": [
+    ".github/workflows/update-dashboard.yml",
+    "apps_script/Code.gs",
+    "drive_sync.py",
+    "hanoi_pm25_pipeline.py",
+    "requirements.txt",
+    "run_pipeline.py",
+    "README_VI.md"
+  ]
+}
