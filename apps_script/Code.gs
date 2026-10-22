@@ -1,327 +1,308 @@
-/**
- * Google Drive bridge for GitHub Actions.
- * Uses the script owner's Google Drive/Sheets permissions. No manual Cloud Console
- * project setup is needed for a normal My Drive folder shared with this account.
- * Configure ROOT_FOLDER_ID and BRIDGE_TOKEN under Project Settings > Script properties.
- */
-function doGet() {
-  return json_({ ok: true, service: "hanoi-pm25-drive-bridge", message: "POST actions only" });
+from __future__ import annotations
+
+import base64
+import os
+import time
+import uuid
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import requests
+
+CHUNK_BYTES = 2 * 1024 * 1024
+SHEET_CHUNK_ROWS = 1000
+MAX_APPS_SCRIPT_FILE_BYTES = 40 * 1024 * 1024  # Giới hạn an toàn 40MB của Apps Script getBlob()
+
+RAW_EXPECTED = {
+    "openaq_hanoi_2019_2026_raw.csv",
+    "open_meteo_hanoi_2019_2026_raw.csv",
+}
+RAW_ALIASES = {
+    "openaq_hanoi_2019_2026_raw.csv": [
+        "openaq_hanoi_2019_2026_raw (1).csv",
+        "openaq_hanoi_2019_2026_raw(1).csv",
+    ],
+    "open_meteo_hanoi_2019_2026_raw.csv": [
+        "open_meteo_hanoi_2019_2026_raw (1).csv",
+        "open_meteo_hanoi_2019_2026_raw(1).csv",
+    ],
+}
+PERSISTENT_ROOT_FILES = RAW_EXPECTED | {
+    alias for aliases in RAW_ALIASES.values() for alias in aliases
+} | {"sensor_poll_state.csv"}
+PERSISTENT_DIRS = {"cache_openaq", "output_hanoi_pm25"}
+
+SHEETS_TABLES = [
+    ("latest_forecast_current", "latest_forecast_current.csv"),
+    ("latest_forecast", "latest_forecast.csv"),
+    ("observed_hourly", "observed_hourly.csv"),
+    ("daily_summary", "daily_summary.csv"),
+    ("model_metrics", "model_metrics.csv"),
+    ("station_freshness", "station_freshness.csv"),
+    ("data_coverage", "data_coverage.csv"),
+    ("run_status", "run_status.csv"),
+]
+
+SKIP_SUFFIXES = {".zip", ".pdf", ".docx", ".xlsx", ".ipynb", ".png", ".jpg", ".jpeg", ".svg", ".gif"}
+
+# Các file đầu ra được tạo mới mỗi lần chạy -> Không cần tải về ở bước 1/4 để tránh tràn RAM Apps Script
+SKIP_DOWNLOAD_NAMES = {
+    "fact_forecast_long.csv",
+    "fact_forecast_long.csv.tmp",
+    "observed_hourly.csv",
+    "daily_summary.csv",
+    "latest_forecast.csv",
+    "latest_forecast_current.csv",
+    "quality_review_rows.csv",
 }
 
-function doPost(e) {
-  try {
-    if (!e || !e.postData || !e.postData.contents) throw new Error("Missing JSON POST body");
-    const p = JSON.parse(e.postData.contents);
-    const expected = PropertiesService.getScriptProperties().getProperty("BRIDGE_TOKEN") || "";
-    if (!expected || !p.token || !constantTimeEqual_(String(p.token), expected)) {
-      throw new Error("Unauthorized: bridge token mismatch");
-    }
-    const action = String(p.action || "");
-    let result;
-    switch (action) {
-      case "list_files": result = { ok: true, files: listProjectFiles_() }; break;
-      case "download_chunk": result = downloadChunk_(p); break;
-      case "upload_chunk": result = uploadChunk_(p); break;
-      case "finish_upload": result = finishUpload_(p); break;
-      case "begin_sheet": result = beginSheet_(p); break;
-      case "write_sheet_rows": result = writeSheetRows_(p); break;
-      case "finish_sheet": result = finishSheet_(p); break;
-      default: throw new Error("Unknown action: " + action);
-    }
-    return json_(result);
-  } catch (err) {
-    return json_({ ok: false, error: String(err && err.message ? err.message : err) });
-  }
-}
 
-function authorizeOnce() {
-  const folder = getDataFolder_();
-  const temp = SpreadsheetApp.create("HANOI_PM25_AUTH_CHECK_TEMP");
-  DriveApp.getFileById(temp.getId()).setTrashed(true);
-  Logger.log("Authorization is ready. Resolved folder: " + folder.getName());
-}
+def _bridge_url() -> str:
+    url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "Thiếu GitHub Secret GOOGLE_APPS_SCRIPT_URL. Hãy dán URL Web App kết thúc bằng /exec."
+        )
+    return url
 
-function json_(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
-}
 
-function constantTimeEqual_(a, b) {
-  if (a.length !== b.length) return false;
-  let x = 0;
-  for (let i = 0; i < a.length; i++) x |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return x === 0;
-}
+def _bridge_token() -> str:
+    token = os.environ.get("GOOGLE_DRIVE_BRIDGE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Thiếu GitHub Secret GOOGLE_DRIVE_BRIDGE_TOKEN.")
+    return token
 
-function getRootFolder_() {
-  const id = PropertiesService.getScriptProperties().getProperty("ROOT_FOLDER_ID");
-  if (!id) throw new Error("Set Script Property ROOT_FOLDER_ID first");
-  return DriveApp.getFolderById(id);
-}
 
-function folderHasRawPair_(folder) {
-  const names = {};
-  const it = folder.getFiles();
-  while (it.hasNext()) names[it.next().getName()] = true;
-  const a = names["openaq_hanoi_2019_2026_raw.csv"] || names["openaq_hanoi_2019_2026_raw (1).csv"] || names["openaq_hanoi_2019_2026_raw(1).csv"];
-  const b = names["open_meteo_hanoi_2019_2026_raw.csv"] || names["open_meteo_hanoi_2019_2026_raw (1).csv"] || names["open_meteo_hanoi_2019_2026_raw(1).csv"];
-  return !!(a && b);
-}
+def _call(action: str, **kwargs: Any) -> dict[str, Any]:
+    payload = {"action": action, "token": _bridge_token(), **kwargs}
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            response = requests.post(_bridge_url(), json=payload, timeout=300, allow_redirects=True)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except ValueError as exc:
+                preview = response.text[:500].replace("\n", " ")
+                raise RuntimeError(
+                    "Apps Script không trả JSON. Kiểm tra đã Deploy Web App, chọn quyền truy cập phù hợp "
+                    f"và dùng URL /exec chưa. Phản hồi: {preview}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Apps Script trả dữ liệu không phải JSON object: {data}")
+            if not data.get("ok"):
+                raise RuntimeError(data.get("error", f"Apps Script lỗi khi chạy action={action}"))
+            return data
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Không kết nối được Apps Script ({action}): {last_error}") from last_error
 
-function findDataFolderRecursive_(folder, depth) {
-  if (folderHasRawPair_(folder)) return folder;
-  if (depth >= 6) return null;
-  const folders = [];
-  const it = folder.getFolders();
-  while (it.hasNext()) folders.push(it.next());
-  folders.sort(function(a, b) {
-    const an = a.getName().toLowerCase(), bn = b.getName().toLowerCase();
-    const ap = (an.indexOf("hanoi") >= 0 || an.indexOf("pm25") >= 0) ? 0 : 1;
-    const bp = (bn.indexOf("hanoi") >= 0 || bn.indexOf("pm25") >= 0) ? 0 : 1;
-    return ap - bp || an.localeCompare(bn);
-  });
-  for (let i = 0; i < folders.length; i++) {
-    const found = findDataFolderRecursive_(folders[i], depth + 1);
-    if (found) return found;
-  }
-  return null;
-}
 
-function getDataFolder_() {
-  const props = PropertiesService.getScriptProperties();
-  const cachedId = props.getProperty("RESOLVED_DATA_FOLDER_ID");
-  if (cachedId) {
-    try {
-      const cached = DriveApp.getFolderById(cachedId);
-      if (folderHasRawPair_(cached)) return cached;
-    } catch (ignored) {}
-  }
-  const found = findDataFolderRecursive_(getRootFolder_(), 0);
-  if (!found) {
-    throw new Error("Cannot find folder containing both required RAW files. Set ROOT_FOLDER_ID to the folder or its parent.");
-  }
-  props.setProperty("RESOLVED_DATA_FOLDER_ID", found.getId());
-  return found;
-}
+def _safe_path(relative_path: str) -> Path:
+    p = PurePosixPath(relative_path)
+    if p.is_absolute() or ".." in p.parts or not p.parts:
+        raise ValueError(f"Đường dẫn từ Apps Script không hợp lệ: {relative_path!r}")
+    return Path(*p.parts)
 
-function isBinaryDriveFile_(file) {
-  const mime = String(file.getMimeType() || "");
-  // Bỏ qua toàn bộ Google Sheets, Docs, Slides, Folder... chỉ lấy file vật lý (CSV, JSON, Parquet)
-  if (mime.indexOf("application/vnd.google-apps.") === 0) return false;
-  return allowedFile_(file.getName());
-}
 
-function listProjectFiles_() {
-  const root = getDataFolder_();
-  const output = [];
-  const rootFiles = root.getFiles();
-  while (rootFiles.hasNext()) {
-    const file = rootFiles.next();
-    const name = file.getName();
-    if (/^(openaq_hanoi_2019_2026_raw( \(1\)|\(1\))?\.csv|open_meteo_hanoi_2019_2026_raw( \(1\)|\(1\))?\.csv|sensor_poll_state\.csv)$/i.test(name) && isBinaryDriveFile_(file)) {
-      output.push({ path: name, size: file.getSize(), mimeType: file.getMimeType() });
-    }
-  }
-  const dirs = root.getFolders();
-  while (dirs.hasNext()) {
-    const dir = dirs.next();
-    if (dir.getName() === "cache_openaq" || dir.getName() === "output_hanoi_pm25") {
-      listTree_(dir, dir.getName(), output, 0);
-    }
-  }
-  return output;
-}
+def _download_file(relative_path: str, size: int, local_root: Path) -> None:
+    dest = Path(local_root) / _safe_path(relative_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
 
-  }
-  const dirs = root.getFolders();
-  while (dirs.hasNext()) {
-    const dir = dirs.next();
-    if (dir.getName() === "cache_openaq" || dir.getName() === "output_hanoi_pm25") {
-      listTree_(dir, dir.getName(), output, 0);
-    }
-  }
-  return output;
-}
+    if size <= 0:
+        dest.touch()
+        print(f"  ✓ Tạo file rỗng {relative_path} (0 B)")
+        return
 
-function listTree_(folder, prefix, output, depth) {
-  if (depth > 8) return;
-  const files = folder.getFiles();
-  while (files.hasNext()) {
-    const file = files.next();
-    if (isBinaryDriveFile_(file)) {
-      output.push({ path: prefix + "/" + file.getName(), size: file.getSize(), mimeType: file.getMimeType() });
-    }
-  }
-  const dirs = folder.getFolders();
-  while (dirs.hasNext()) {
-    const dir = dirs.next();
-    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
-  }
-}
+    offset = 0
+    with tmp.open("wb") as fh:
+        while offset < size:
+            result = _call("download_chunk", path=relative_path, offset=offset, chunkSize=CHUNK_BYTES)
+            chunk_str = result.get("base64") if isinstance(result, dict) else None
+            if chunk_str is None:
+                raise RuntimeError(
+                    f"[LỖI TRẢ VỀ TỪ SCRIPT] Tải '{relative_path}' tại offset {offset} không có key 'base64': {result}"
+                )
+            chunk = base64.b64decode(chunk_str) if chunk_str else b""
+            if not chunk and offset < size:
+                break
+            fh.write(chunk)
+            offset += len(chunk)
 
-  }
-  const dirs = folder.getFolders();
-  while (dirs.hasNext()) {
-    const dir = dirs.next();
-    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
-  }
-}
-  }
-  const dirs = folder.getFolders();
-  while (dirs.hasNext()) {
-    const dir = dirs.next();
-    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
-  }
-}
-  }
-  const dirs = folder.getFolders();
-  while (dirs.hasNext()) {
-    const dir = dirs.next();
-    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
-  }
-}
+    tmp.replace(dest)
+    print(f"  ✓ Tải {relative_path} ({size / (1024 * 1024):.1f} MiB)")
 
-function resolvePath_(relativePath, createFolders) {
-  const parts = String(relativePath || "").split("/").filter(Boolean);
-  if (!parts.length || parts.some(function(x) { return x === "." || x === ".."; })) throw new Error("Invalid path");
-  let folder = getDataFolder_();
-  for (let i = 0; i < parts.length - 1; i++) {
-    let found = null;
-    const it = folder.getFoldersByName(parts[i]);
-    if (it.hasNext()) found = it.next();
-    if (!found && createFolders) found = folder.createFolder(parts[i]);
-    if (!found) throw new Error("Folder path not found: " + parts.slice(0, i + 1).join("/"));
-    folder = found;
-  }
-  const fileName = parts[parts.length - 1];
-  const files = folder.getFilesByName(fileName);
-  return { folder: folder, fileName: fileName, file: files.hasNext() ? files.next() : null };
-}
 
-function downloadChunk_(p) {
-  const resolved = resolvePath_(p.path, false);
-  if (!resolved.file) throw new Error("File not found: " + p.path);
-  const bytes = resolved.file.getBlob().getBytes();
-  const offset = Math.max(0, Number(p.offset || 0));
-  const size = Math.max(1, Math.min(2 * 1024 * 1024, Number(p.chunkSize || 2 * 1024 * 1024)));
-  const chunk = bytes.slice(offset, Math.min(bytes.length, offset + size));
-  return { ok: true, totalSize: bytes.length, offset: offset, base64: Utilities.base64Encode(chunk) };
-}
+def _download_project_manifest() -> list[dict[str, Any]]:
+    response = _call("list_files")
+    files = response.get("files", [])
+    names_at_root = {x["path"] for x in files if "/" not in x["path"]}
+    missing = []
+    for expected, aliases in RAW_ALIASES.items():
+        if expected not in names_at_root and not any(x in names_at_root for x in aliases):
+            missing.append(expected)
+    if missing:
+        raise FileNotFoundError(
+            "Apps Script tìm được thư mục nhưng không thấy các file RAW bắt buộc: " + ", ".join(missing)
+            + ". Hãy đặt ROOT_FOLDER_ID thành thư mục chứa hai file RAW, hoặc để bộ dò tìm ở thư mục cha."
+        )
+    return files
 
-function uploadChunk_(p) {
-  const uploadId = String(p.uploadId || "");
-  const chunkIndex = Number(p.chunkIndex);
-  const encoded = String(p.base64 || "");
-  if (!/^[a-f0-9]{20,64}$/i.test(uploadId)) throw new Error("Invalid uploadId");
-  if (!Number.isInteger(chunkIndex) || chunkIndex < 0) throw new Error("Invalid chunkIndex");
-  const root = getDataFolder_();
-  let staging = null;
-  const folders = root.getFoldersByName(".github_actions_upload_staging");
-  staging = folders.hasNext() ? folders.next() : root.createFolder(".github_actions_upload_staging");
-  const partName = uploadId + "__" + chunkIndex + ".txt";
-  const existing = staging.getFilesByName(partName);
-  while (existing.hasNext()) existing.next().setTrashed(true);
-  staging.createFile(partName, encoded, MimeType.PLAIN_TEXT);
-  return { ok: true, chunkIndex: chunkIndex };
-}
 
-function finishUpload_(p) {
-  const uploadId = String(p.uploadId || "");
-  const totalChunks = Number(p.totalChunks);
-  const relativePath = String(p.path || "");
-  if (!/^[a-f0-9]{20,64}$/i.test(uploadId)) throw new Error("Invalid uploadId");
-  if (!Number.isInteger(totalChunks) || totalChunks < 1) throw new Error("Invalid totalChunks");
-  const root = getDataFolder_();
-  const stagingIt = root.getFoldersByName(".github_actions_upload_staging");
-  if (!stagingIt.hasNext()) throw new Error("Upload staging folder missing");
-  const staging = stagingIt.next();
-  const bytes = [];
-  const partsToTrash = [];
-  for (let i = 0; i < totalChunks; i++) {
-    const it = staging.getFilesByName(uploadId + "__" + i + ".txt");
-    if (!it.hasNext()) throw new Error("Missing upload chunk " + i + " of " + totalChunks);
-    const part = it.next();
-    partsToTrash.push(part);
-    const bin = Utilities.base64Decode(part.getBlob().getDataAsString());
-    for (let j = 0; j < bin.length; j++) bytes.push(bin[j]);
-  }
-  const resolved = resolvePath_(relativePath, true);
-  if (resolved.file) resolved.file.setTrashed(true);
-  const blob = Utilities.newBlob(bytes, "application/octet-stream", resolved.fileName);
-  resolved.folder.createFile(blob);
-  partsToTrash.forEach(function(f) { f.setTrashed(true); });
-  return { ok: true, path: relativePath, size: bytes.length };
-}
+def download_project_state(local_root: Path) -> None:
+    local_root.mkdir(parents=True, exist_ok=True)
+    files = _download_project_manifest()
+    print(f"-> Tìm thấy {len(files)} file trạng thái/RAW/đầu ra trên Drive.")
+    for item in files:
+        rel_path = item["path"]
+        file_name = Path(rel_path).name
+        file_size = int(item.get("size", 0))
+        mime_type = str(item.get("mimeType", ""))
 
-function findSheetFile_(folder, title) {
-  const files = folder.getFilesByName(title);
-  while (files.hasNext()) {
-    const file = files.next();
-    if (file.getMimeType() === MimeType.GOOGLE_SHEETS) return file;
-  }
-  return null;
-}
+        # Bỏ qua Google Sheets/Docs/Folder hoặc các file quá lớn / không cần thiết
+        if (
+            mime_type.startswith("application/vnd.google-apps.")
+            or file_name in SKIP_DOWNLOAD_NAMES
+            or Path(rel_path).suffix.lower() in SKIP_SUFFIXES
+            or file_size > MAX_APPS_SCRIPT_FILE_BYTES
+        ):
+            print(f"  [-] Bỏ qua tải file: {rel_path} ({file_size / (1024 * 1024):.1f} MiB)")
+            continue
 
-function beginSheet_(p) {
-  const title = String(p.title || "").trim();
-  const headers = p.headers;
-  const totalRows = Number(p.totalRows || 1);
-  const totalCols = Number(p.totalCols || (headers || []).length);
-  if (!title || !Array.isArray(headers) || !headers.length) throw new Error("Invalid sheet title/headers");
-  if (totalRows * Math.max(totalCols, 1) > 9500000) throw new Error("Sheet would exceed the 9.5M-cell safety threshold");
-  const folder = getDataFolder_();
-  let file = findSheetFile_(folder, title);
-  let book;
-  if (file) {
-    book = SpreadsheetApp.openById(file.getId());
-  } else {
-    book = SpreadsheetApp.create(title);
-    DriveApp.getFileById(book.getId()).moveTo(folder);
-  }
-  let sheet = book.getSheets()[0];
-  if (!sheet) sheet = book.insertSheet("Sheet1");
-  sheet.clear();
-  if (sheet.getMaxRows() < totalRows) sheet.insertRowsAfter(sheet.getMaxRows(), totalRows - sheet.getMaxRows());
-  if (sheet.getMaxColumns() < totalCols) sheet.insertColumnsAfter(sheet.getMaxColumns(), totalCols - sheet.getMaxColumns());
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sheet.setFrozenRows(1);
-  book.setSpreadsheetTimeZone("Asia/Ho_Chi_Minh");
-  return { ok: true, spreadsheetId: book.getId(), url: book.getUrl(), rows: totalRows, cols: totalCols };
-}
+        try:
+            _download_file(rel_path, file_size, local_root)
+        except Exception as exc:
+            is_critical = (
+                file_name in RAW_EXPECTED
+                or any(file_name in aliases for aliases in RAW_ALIASES.values())
+                or "sensor_poll_state.csv" in file_name
+            )
+            if not is_critical:
+                print(f"  [!] Cảnh báo: Bỏ qua {rel_path} do lỗi tải: {exc}")
+            else:
+                raise exc
 
-function writeSheetRows_(p) {
-  const id = String(p.spreadsheetId || "");
-  const headers = p.headers;
-  const rows = p.rows;
-  const startRow = Number(p.startRow);
-  if (!id || !Array.isArray(headers) || !Array.isArray(rows) || !Number.isInteger(startRow) || startRow < 2) throw new Error("Invalid sheet row payload");
-  if (rows.length === 0) return { ok: true, written: 0 };
-  const book = SpreadsheetApp.openById(id);
-  const sheet = book.getSheets()[0];
-  const neededRows = startRow + rows.length - 1;
-  if (sheet.getMaxRows() < neededRows) sheet.insertRowsAfter(sheet.getMaxRows(), neededRows - sheet.getMaxRows());
-  if (sheet.getMaxColumns() < headers.length) sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
-  const normalized = rows.map(function(row) {
-    return headers.map(function(header, i) { return sheetValue_(header, row[i]); });
-  });
-  sheet.getRange(startRow, 1, normalized.length, headers.length).setValues(normalized);
-  return { ok: true, written: normalized.length, startRow: startRow };
-}
+    # Chuẩn hóa tên file có hậu tố (1)
+    for canonical, aliases in RAW_ALIASES.items():
+        destination = local_root / canonical
+        if destination.exists():
+            continue
+        for alias in aliases:
+            candidate = local_root / alias
+            if candidate.exists():
+                candidate.rename(destination)
+                break
 
-function sheetValue_(header, value) {
-  if (value === null || value === undefined || value === "") return "";
-  if (typeof value !== "string") return value;
-  if (/(^date$|datetime|timestamp|_time|time_local|issue_time|target_time)/i.test(String(header))) {
-    const candidate = value.trim();
-    if (/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.test(candidate)) {
-      const d = new Date(candidate.replace(" ", "T"));
-      if (!isNaN(d.getTime())) return d;
-    }
-  }
-  return value;
-}
+    missing = [name for name in RAW_EXPECTED if not (local_root / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"Thiếu file RAW sau khi tải từ Drive: {missing}")
 
-function finishSheet_(p) {
-  const book = SpreadsheetApp.openById(String(p.spreadsheetId || ""));
-  SpreadsheetApp.flush();
-  return { ok: true, spreadsheetId: book.getId(), url: book.getUrl() };
-}
+
+def _iter_state_files(local_root: Path):
+    for name in sorted(PERSISTENT_ROOT_FILES):
+        path = local_root / name
+        if path.is_file():
+            yield path, path.relative_to(local_root).as_posix()
+    for dirname in sorted(PERSISTENT_DIRS):
+        base = local_root / dirname
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if path.is_file() and path.suffix.lower() not in SKIP_SUFFIXES:
+                # Không đẩy các file CSV quá 40MB qua Apps Script để tránh tràn bộ nhớ
+                if path.stat().st_size > MAX_APPS_SCRIPT_FILE_BYTES:
+                    print(f"  [-] Bỏ qua upload file quá lớn (>40MB): {path.name}")
+                    continue
+                yield path, path.relative_to(local_root).as_posix()
+
+
+def _upload_file(local_file: Path, relative_path: str) -> None:
+    upload_id = uuid.uuid4().hex
+    total_size = local_file.stat().st_size
+    total_chunks = max(1, (total_size + CHUNK_BYTES - 1) // CHUNK_BYTES)
+    with local_file.open("rb") as fh:
+        for index in range(total_chunks):
+            chunk = fh.read(CHUNK_BYTES)
+            _call(
+                "upload_chunk",
+                uploadId=upload_id,
+                path=relative_path,
+                chunkIndex=index,
+                totalChunks=total_chunks,
+                base64=base64.b64encode(chunk).decode("ascii"),
+            )
+    _call("finish_upload", uploadId=upload_id, path=relative_path, totalChunks=total_chunks)
+    print(f"   ✓ Ghi {relative_path} ({total_size / (1024 * 1024):.1f} MiB)")
+
+
+def upload_project_state(local_root: Path) -> None:
+    count = 0
+    for local_file, rel in _iter_state_files(local_root):
+        _upload_file(local_file, rel)
+        count += 1
+    print(f"-> Đã gửi {count} file RAW/state/cache/output về Drive.")
+
+
+def _json_value(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _sync_csv_sheet(title: str, csv_path: Path) -> None:
+    frame = pd.read_csv(csv_path, low_memory=False)
+    # Nếu là bảng observed_hourly (rất lớn), chỉ giữ 25,000 dòng mới nhất để đồng bộ nhanh lên Google Sheets
+    if title == "observed_hourly" and len(frame) > 25000:
+        if "datetime" in frame.columns:
+            frame = frame.sort_values("datetime").tail(25000).reset_index(drop=True)
+        else:
+            frame = frame.tail(25000).reset_index(drop=True)
+        print(f"   [i] Rút gọn '{title}' xuống 25,000 dòng mới nhất để đồng bộ Google Sheets mượt mà.")
+
+    rows_total, cols = frame.shape[0] + 1, frame.shape[1]
+    if rows_total * max(cols, 1) > 9_500_000:
+        print(f"[!] Bỏ qua Google Sheets '{title}': {rows_total:,} × {cols:,} ô gần/vượt giới hạn 10 triệu ô.")
+        return
+    headers = [str(col) for col in frame.columns]
+    init = _call("begin_sheet", title=title, headers=headers, totalRows=rows_total, totalCols=cols)
+    spreadsheet_id = init["spreadsheetId"]
+    url = init.get("url", f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit")
+    for start in range(0, len(frame), SHEET_CHUNK_ROWS):
+        part = frame.iloc[start : start + SHEET_CHUNK_ROWS]
+        values = [[_json_value(v) for v in row] for row in part.itertuples(index=False, name=None)]
+        _call(
+            "write_sheet_rows",
+            spreadsheetId=spreadsheet_id,
+            headers=headers,
+            startRow=start + 2,
+            rows=values,
+        )
+        if (start // SHEET_CHUNK_ROWS) % 10 == 0:
+            print(f"   -> {title}: {min(start + len(part), len(frame)):,}/{len(frame):,} dòng")
+    _call("finish_sheet", spreadsheetId=spreadsheet_id)
+    print(f"-> Google Sheets đã cập nhật: {title} | {rows_total:,} hàng | {url}")
+
+
+def sync_dashboard_sheets(output_dir: Path) -> None:
+    for title, filename in SHEETS_TABLES:
+        csv_path = output_dir / filename
+        if not csv_path.is_file():
+            print(f"[!] Bỏ qua '{title}': chưa có file {filename}")
+            continue
+        try:
+            _sync_csv_sheet(title, csv_path)
+        except Exception as exc:
+            print(f"[!] Không đồng bộ được '{title}' sang Google Sheets: {exc}")
