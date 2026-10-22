@@ -102,13 +102,13 @@ def _download_file(relative_path: str, size: int, local_root: Path) -> None:
         while offset < size:
             result = _call("download_chunk", path=relative_path, offset=offset, chunkSize=CHUNK_BYTES)
             chunk = base64.b64decode(result["base64"])
-            if not chunk and offset < size:
-                raise RuntimeError(f"Nhận chunk rỗng khi tải {relative_path} tại byte {offset}")
-            fh.write(chunk)
-            offset += len(chunk)
-    tmp.replace(dest)
-    print(f"   ✓ Tải {relative_path} ({size / (1024 * 1024):.1f} MiB)")
+            if "base64" not in result:
+    raise RuntimeError(
+        "Apps Script không trả về dữ liệu base64. "
+        f"Phản hồi nhận được: {result}"
+    )
 
+chunk = base64.b64decode(result["base64"])
 
 def _download_project_manifest() -> list[dict[str, Any]]:
     response = _call("list_files")
