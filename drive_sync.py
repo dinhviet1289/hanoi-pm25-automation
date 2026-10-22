@@ -129,25 +129,19 @@ def download_project_state(local_root: Path) -> None:
     for item in files:
         rel_path = item["path"]
         file_name = Path(rel_path).name
-        file_size = int(item.get("size", 0))
-        mime_type = str(item.get("mimeType", ""))
-
-        if (
-            mime_type.startswith("application/vnd.google-apps.")
-            or file_name in SKIP_DOWNLOAD_NAMES
-            or "fact_forecast_long" in file_name
-            or Path(rel_path).suffix.lower() in SKIP_SUFFIXES
-            or file_size > MAX_APPS_SCRIPT_FILE_BYTES
-        ):
+        
+        # CHỈ TẢI ĐÚNG 2 FILE RAW VÀ SENSOR STATE, BỎ QUA TẤT CẢ CÒN LẠI
+        if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
+            print(f"  [-] Bỏ qua không tải: {rel_path}")
             continue
 
         try:
-            _download_file(rel_path, file_size, local_root)
+            _download_file(rel_path, int(item.get("size", 0)), local_root)
         except Exception as exc:
-            is_critical = file_name in RAW_EXPECTED or "sensor_poll_state.csv" in file_name
-            if is_critical:
-                raise exc
+            print(f"  [!] Lỗi tải {rel_path}: {exc}")
+            raise exc
 
+    # Chuẩn hóa tên file có hậu tố (1)
     for canonical, aliases in RAW_ALIASES.items():
         destination = local_root / canonical
         if destination.exists():
@@ -157,11 +151,6 @@ def download_project_state(local_root: Path) -> None:
             if candidate.exists():
                 candidate.rename(destination)
                 break
-
-    missing = [name for name in RAW_EXPECTED if not (local_root / name).exists()]
-    if missing:
-        raise FileNotFoundError(f"Thiếu file RAW: {missing}")
-
 def _iter_state_files(local_root: Path):
     for name in sorted(PERSISTENT_ROOT_FILES):
         path = local_root / name
