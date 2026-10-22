@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 import base64
@@ -75,6 +76,8 @@ def _call(action: str, **kwargs: Any) -> dict[str, Any]:
                     "Apps Script không trả JSON. Kiểm tra đã Deploy Web App, chọn quyền truy cập phù hợp "
                     f"và dùng URL /exec chưa. Phản hồi: {preview}"
                 ) from exc
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Apps Script trả dữ liệu không phải JSON object: {data}")
             if not data.get("ok"):
                 raise RuntimeError(data.get("error", f"Apps Script lỗi khi chạy action={action}"))
             return data
@@ -92,12 +95,11 @@ def _safe_path(relative_path: str) -> Path:
     return Path(*p.parts)
 
 
-def _download_file(relative_path, size, local_root):
+def _download_file(relative_path: str, size: int, local_root: Path) -> None:
     dest = Path(local_root) / relative_path
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     
-    # Trường hợp file rỗng (0 bytes)
     if size == 0:
         dest.touch()
         print(f"  ✓ Tạo file rỗng {relative_path} (0 B)")
@@ -106,34 +108,27 @@ def _download_file(relative_path, size, local_root):
     offset = 0
     with tmp.open("wb") as fh:
         while offset < size:
-            # Gọi API lấy chunk
             result = _call("download_chunk", path=relative_path, offset=offset, chunkSize=CHUNK_BYTES)
             
-            # 1. Bắt lỗi nếu API trả về chuỗi HTML, string lỗi hoặc không phải dict
-            if not isinstance(result, dict):
+            # Kiểm tra trường base64 an toàn tuyệt đối
+            if "base64" not in result:
                 raise RuntimeError(
-                    f"API không trả về định dạng JSON hợp lệ khi tải '{relative_path}'.\n"
-                    f"Nội dung nhận được: {str(result)[:300]}"
+                    f"\n[LỖI APPS SCRIPT] Không tìm thấy dữ liệu 'base64' khi tải '{relative_path}' tại vị trí byte {offset}."
+                    f"\nKết quả trả về từ Script: {result}"
                 )
-
-            # 2. Bắt lỗi nếu API trả về thông báo lỗi cụ thể (error / message)
-            if "error" in result or "base64" not in result:
-                raise RuntimeError(
-                    f"Không tìm thấy trường 'base64' khi tải '{relative_path}' tại offset {offset}.\n"
-                    f"Dữ liệu API trả về: {result}"
-                )
-
-            chunk_str = result.get("base64", "")
-            chunk = base64.b64decode(chunk_str) if chunk_str else b""
+            
+            chunk_b64 = result.get("base64")
+            chunk = base64.b64decode(chunk_b64) if chunk_b64 else b""
 
             if not chunk and offset < size:
-                raise RuntimeError(f"Nhận chunk rỗng khi tải {relative_path} tại byte {offset} (tổng dung lượng: {size})")
+                raise RuntimeError(f"Nhận chunk rỗng khi tải {relative_path} tại byte {offset} (tổng size: {size})")
 
             fh.write(chunk)
             offset += len(chunk)
 
     tmp.replace(dest)
     print(f"  ✓ Tải {relative_path} ({size / (1024 * 1024):.1f} MiB)")
+
 
 def _download_project_manifest() -> list[dict[str, Any]]:
     response = _call("list_files")
@@ -158,7 +153,6 @@ def download_project_state(local_root: Path) -> None:
     for item in files:
         _download_file(item["path"], int(item.get("size", 0)), local_root)
 
-    # Normalize files downloaded from browsers with the duplicate suffix "(1)".
     for canonical, aliases in RAW_ALIASES.items():
         destination = local_root / canonical
         if destination.exists():
@@ -216,14 +210,12 @@ def upload_project_state(local_root: Path) -> None:
 
 
 def _json_value(value: Any) -> Any:
-    if value is None:
-        return None
-    if pd.isna(value):
+    if value is None or pd.isna(value):
         return None
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
     if isinstance(value, np.generic):
-        value = value.item()
+        return value.item()
     if isinstance(value, float) and not np.isfinite(value):
         return None
     if isinstance(value, (str, int, float, bool)):
