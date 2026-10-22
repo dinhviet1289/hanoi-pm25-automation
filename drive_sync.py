@@ -151,8 +151,24 @@ def download_project_state(local_root: Path) -> None:
     files = _download_project_manifest()
     print(f"-> Tìm thấy {len(files)} file trạng thái/RAW/đầu ra trên Drive.")
     for item in files:
-        _download_file(item["path"], int(item.get("size", 0)), local_root)
+        rel_path = item["path"]
+        file_name = Path(rel_path).name
 
+        # Bỏ qua các file được định nghĩa không cần tải hoặc file định dạng cấm
+        if file_name in SKIP_DOWNLOAD_NAMES or Path(rel_path).suffix.lower() in SKIP_SUFFIXES:
+            print(f"  [-] Bỏ qua tải file lớn / không cần thiết: {rel_path}")
+            continue
+
+        try:
+            _download_file(rel_path, int(item.get("size", 0)), local_root)
+        except Exception as exc:
+            # Nếu không phải là file RAW cốt lõi thì cho phép bỏ qua và in cảnh báo
+            if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
+                print(f"  [!] Cảnh báo: Bỏ qua {rel_path} do lỗi tải: {exc}")
+            else:
+                raise exc
+
+    # Chuẩn hóa tên file nếu tải từ trình duyệt có hậu tố (1)
     for canonical, aliases in RAW_ALIASES.items():
         destination = local_root / canonical
         if destination.exists():
@@ -166,7 +182,6 @@ def download_project_state(local_root: Path) -> None:
     missing = [name for name in RAW_EXPECTED if not (local_root / name).exists()]
     if missing:
         raise FileNotFoundError(f"Thiếu file RAW sau khi tải từ Drive: {missing}")
-
 
 def _iter_state_files(local_root: Path):
     for name in sorted(PERSISTENT_ROOT_FILES):
