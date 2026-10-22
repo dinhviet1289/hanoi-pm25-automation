@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import base64
@@ -43,6 +42,11 @@ SHEETS_TABLES = [
     ("run_status", "run_status.csv"),
 ]
 SKIP_SUFFIXES = {".zip", ".pdf", ".docx", ".xlsx", ".ipynb", ".png", ".jpg", ".jpeg", ".svg", ".gif"}
+# Bỏ qua tệp lịch sử quá lớn vượt hạn mức của Google Apps Script
+SKIP_DOWNLOAD_NAMES = {
+    "fact_forecast_long.csv",
+    "fact_forecast_long.csv.tmp",
+}
 
 
 def _bridge_url() -> str:
@@ -99,7 +103,7 @@ def _download_file(relative_path: str, size: int, local_root: Path) -> None:
     dest = Path(local_root) / relative_path
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    
+
     if size == 0:
         dest.touch()
         print(f"  ✓ Tạo file rỗng {relative_path} (0 B)")
@@ -109,16 +113,15 @@ def _download_file(relative_path: str, size: int, local_root: Path) -> None:
     with tmp.open("wb") as fh:
         while offset < size:
             result = _call("download_chunk", path=relative_path, offset=offset, chunkSize=CHUNK_BYTES)
-            
-            # Kiểm tra trường base64 an toàn tuyệt đối
-            if "base64" not in result:
+
+            if not isinstance(result, dict) or "base64" not in result:
                 raise RuntimeError(
-                    f"\n[LỖI APPS SCRIPT] Không tìm thấy dữ liệu 'base64' khi tải '{relative_path}' tại vị trí byte {offset}."
-                    f"\nKết quả trả về từ Script: {result}"
+                    f"\n[LỖI TRẢ VỀ TỪ SCRIPT] Tải '{relative_path}' tại offset {offset} không có key 'base64'.\n"
+                    f"Nội dung nhận được: {result}"
                 )
-            
-            chunk_b64 = result.get("base64")
-            chunk = base64.b64decode(chunk_b64) if chunk_b64 else b""
+
+            chunk_str = result.get("base64")
+            chunk = base64.b64decode(chunk_str) if chunk_str else b""
 
             if not chunk and offset < size:
                 raise RuntimeError(f"Nhận chunk rỗng khi tải {relative_path} tại byte {offset} (tổng size: {size})")
@@ -154,7 +157,7 @@ def download_project_state(local_root: Path) -> None:
         rel_path = item["path"]
         file_name = Path(rel_path).name
 
-        # Bỏ qua các file được định nghĩa không cần tải hoặc file định dạng cấm
+        # Bỏ qua file lịch sử quá lớn hoặc file không cần thiết
         if file_name in SKIP_DOWNLOAD_NAMES or Path(rel_path).suffix.lower() in SKIP_SUFFIXES:
             print(f"  [-] Bỏ qua tải file lớn / không cần thiết: {rel_path}")
             continue
@@ -162,13 +165,12 @@ def download_project_state(local_root: Path) -> None:
         try:
             _download_file(rel_path, int(item.get("size", 0)), local_root)
         except Exception as exc:
-            # Nếu không phải là file RAW cốt lõi thì cho phép bỏ qua và in cảnh báo
+            # Nếu không phải file RAW gốc bắt buộc thì cho qua kèm cảnh báo
             if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
                 print(f"  [!] Cảnh báo: Bỏ qua {rel_path} do lỗi tải: {exc}")
             else:
                 raise exc
 
-    # Chuẩn hóa tên file nếu tải từ trình duyệt có hậu tố (1)
     for canonical, aliases in RAW_ALIASES.items():
         destination = local_root / canonical
         if destination.exists():
@@ -182,6 +184,7 @@ def download_project_state(local_root: Path) -> None:
     missing = [name for name in RAW_EXPECTED if not (local_root / name).exists()]
     if missing:
         raise FileNotFoundError(f"Thiếu file RAW sau khi tải từ Drive: {missing}")
+
 
 def _iter_state_files(local_root: Path):
     for name in sorted(PERSISTENT_ROOT_FILES):
@@ -230,7 +233,7 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
     if isinstance(value, np.generic):
-        return value.item()
+        value = value.item()
     if isinstance(value, float) and not np.isfinite(value):
         return None
     if isinstance(value, (str, int, float, bool)):
