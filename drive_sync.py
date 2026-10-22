@@ -13,6 +13,8 @@ import requests
 
 CHUNK_BYTES = 2 * 1024 * 1024
 SHEET_CHUNK_ROWS = 1000
+MAX_APPS_SCRIPT_FILE_BYTES = 40 * 1024 * 1024  # Giới hạn an toàn 40 MiB cho Apps Script
+
 RAW_EXPECTED = {
     "openaq_hanoi_2019_2026_raw.csv",
     "open_meteo_hanoi_2019_2026_raw.csv",
@@ -31,6 +33,7 @@ PERSISTENT_ROOT_FILES = RAW_EXPECTED | {
     alias for aliases in RAW_ALIASES.values() for alias in aliases
 } | {"sensor_poll_state.csv"}
 PERSISTENT_DIRS = {"cache_openaq", "output_hanoi_pm25"}
+
 SHEETS_TABLES = [
     ("latest_forecast_current", "latest_forecast_current.csv"),
     ("latest_forecast", "latest_forecast.csv"),
@@ -41,11 +44,18 @@ SHEETS_TABLES = [
     ("data_coverage", "data_coverage.csv"),
     ("run_status", "run_status.csv"),
 ]
+
 SKIP_SUFFIXES = {".zip", ".pdf", ".docx", ".xlsx", ".ipynb", ".png", ".jpg", ".jpeg", ".svg", ".gif"}
-# Bỏ qua tệp lịch sử quá lớn vượt hạn mức của Google Apps Script
+
+# Các file đầu ra lớn không cần tải về ở bước 1/4 để tránh lỗi vượt 50MB của Apps Script
 SKIP_DOWNLOAD_NAMES = {
     "fact_forecast_long.csv",
     "fact_forecast_long.csv.tmp",
+    "observed_hourly.csv",
+    "daily_summary.csv",
+    "latest_forecast.csv",
+    "latest_forecast_current.csv",
+    "quality_review_rows.csv",
 }
 
 
@@ -100,11 +110,11 @@ def _safe_path(relative_path: str) -> Path:
 
 
 def _download_file(relative_path: str, size: int, local_root: Path) -> None:
-    dest = Path(local_root) / relative_path
+    dest = Path(local_root) / _safe_path(relative_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
 
-    if size == 0:
+    if size <= 0:
         dest.touch()
         print(f"  ✓ Tạo file rỗng {relative_path} (0 B)")
         return
@@ -113,19 +123,14 @@ def _download_file(relative_path: str, size: int, local_root: Path) -> None:
     with tmp.open("wb") as fh:
         while offset < size:
             result = _call("download_chunk", path=relative_path, offset=offset, chunkSize=CHUNK_BYTES)
-
-            if not isinstance(result, dict) or "base64" not in result:
+            chunk_str = result.get("base64") if isinstance(result, dict) else None
+            if chunk_str is None:
                 raise RuntimeError(
-                    f"\n[LỖI TRẢ VỀ TỪ SCRIPT] Tải '{relative_path}' tại offset {offset} không có key 'base64'.\n"
-                    f"Nội dung nhận được: {result}"
+                    f"[LỖI TRẢ VỀ TỪ SCRIPT] Tải '{relative_path}' tại offset {offset} không có key 'base64': {result}"
                 )
-
-            chunk_str = result.get("base64")
             chunk = base64.b64decode(chunk_str) if chunk_str else b""
-
             if not chunk and offset < size:
-                raise RuntimeError(f"Nhận chunk rỗng khi tải {relative_path} tại byte {offset} (tổng size: {size})")
-
+                break
             fh.write(chunk)
             offset += len(chunk)
 
@@ -156,17 +161,29 @@ def download_project_state(local_root: Path) -> None:
     for item in files:
         rel_path = item["path"]
         file_name = Path(rel_path).name
+        file_size = int(item.get("size", 0))
+        mime_type = str(item.get("mimeType", ""))
 
-        # Bỏ qua file lịch sử quá lớn hoặc file định dạng cấm
-        if file_name in SKIP_DOWNLOAD_NAMES or Path(rel_path).suffix.lower() in SKIP_SUFFIXES:
-            print(f"  [-] Bỏ qua tải file lớn / không cần thiết: {rel_path}")
+        # Chặn tải các file quá lớn (>40MB), file Google Sheets hoặc file trong danh sách bỏ qua
+        if (
+            mime_type.startswith("application/vnd.google-apps.")
+            or file_name in SKIP_DOWNLOAD_NAMES
+            or "fact_forecast_long" in file_name
+            or Path(rel_path).suffix.lower() in SKIP_SUFFIXES
+            or file_size > MAX_APPS_SCRIPT_FILE_BYTES
+        ):
+            print(f"  [-] Bỏ qua tải file lớn / không cần thiết: {rel_path} ({file_size / (1024 * 1024):.1f} MiB)")
             continue
 
         try:
-            _download_file(rel_path, int(item.get("size", 0)), local_root)
+            _download_file(rel_path, file_size, local_root)
         except Exception as exc:
-            # Nếu file lỗi không phải 2 file RAW gốc thì bỏ qua để pipeline tiếp tục chạy
-            if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
+            is_critical = (
+                file_name in RAW_EXPECTED
+                or any(file_name in aliases for aliases in RAW_ALIASES.values())
+                or "sensor_poll_state.csv" in file_name
+            )
+            if not is_critical:
                 print(f"  [!] Cảnh báo: Bỏ qua {rel_path} do lỗi tải: {exc}")
             else:
                 raise exc
@@ -198,6 +215,13 @@ def _iter_state_files(local_root: Path):
             continue
         for path in sorted(base.rglob("*")):
             if path.is_file() and path.suffix.lower() not in SKIP_SUFFIXES:
+                if (
+                    "fact_forecast_long" in path.name
+                    or path.name == "observed_hourly.csv"
+                    or path.stat().st_size > MAX_APPS_SCRIPT_FILE_BYTES
+                ):
+                    print(f"  [-] Bỏ qua upload file quá lớn (>40MB): {path.name}")
+                    continue
                 yield path, path.relative_to(local_root).as_posix()
 
 
@@ -244,6 +268,14 @@ def _json_value(value: Any) -> Any:
 
 def _sync_csv_sheet(title: str, csv_path: Path) -> None:
     frame = pd.read_csv(csv_path, low_memory=False)
+    # Rút gọn observed_hourly xuống 20,000 dòng mới nhất để Google Sheets không bao giờ bị lỗi 500
+    if title == "observed_hourly" and len(frame) > 20000:
+        if "datetime" in frame.columns:
+            frame = frame.sort_values("datetime").tail(20000).reset_index(drop=True)
+        else:
+            frame = frame.tail(20000).reset_index(drop=True)
+        print(f"   [i] Rút gọn '{title}' xuống 20,000 dòng mới nhất để đồng bộ Google Sheets mượt mà.")
+
     rows_total, cols = frame.shape[0] + 1, frame.shape[1]
     if rows_total * max(cols, 1) > 9_500_000:
         print(f"[!] Bỏ qua Google Sheets '{title}': {rows_total:,} × {cols:,} ô gần/vượt giới hạn 10 triệu ô.")
@@ -262,7 +294,7 @@ def _sync_csv_sheet(title: str, csv_path: Path) -> None:
             startRow=start + 2,
             rows=values,
         )
-        if (start // SHEET_CHUNK_ROWS) % 20 == 0:
+        if (start // SHEET_CHUNK_ROWS) % 10 == 0:
             print(f"   -> {title}: {min(start + len(part), len(frame)):,}/{len(frame):,} dòng")
     _call("finish_sheet", spreadsheetId=spreadsheet_id)
     print(f"-> Google Sheets đã cập nhật: {title} | {rows_total:,} hàng | {url}")
