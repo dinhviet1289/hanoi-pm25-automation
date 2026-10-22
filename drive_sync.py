@@ -157,7 +157,7 @@ def download_project_state(local_root: Path) -> None:
         rel_path = item["path"]
         file_name = Path(rel_path).name
 
-        # Bỏ qua file lịch sử quá lớn hoặc file không cần thiết
+        # Bỏ qua file lịch sử quá lớn hoặc file định dạng cấm
         if file_name in SKIP_DOWNLOAD_NAMES or Path(rel_path).suffix.lower() in SKIP_SUFFIXES:
             print(f"  [-] Bỏ qua tải file lớn / không cần thiết: {rel_path}")
             continue
@@ -165,12 +165,13 @@ def download_project_state(local_root: Path) -> None:
         try:
             _download_file(rel_path, int(item.get("size", 0)), local_root)
         except Exception as exc:
-            # Nếu không phải file RAW gốc bắt buộc thì cho qua kèm cảnh báo
+            # Nếu file lỗi không phải 2 file RAW gốc thì bỏ qua để pipeline tiếp tục chạy
             if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
                 print(f"  [!] Cảnh báo: Bỏ qua {rel_path} do lỗi tải: {exc}")
             else:
                 raise exc
 
+    # Chuẩn hóa tên file có hậu tố (1)
     for canonical, aliases in RAW_ALIASES.items():
         destination = local_root / canonical
         if destination.exists():
