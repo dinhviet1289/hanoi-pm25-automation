@@ -104,10 +104,13 @@ def _download_file(relative_path: str, size: int, local_root: Path) -> None:
             chunk = base64.b64decode(result["base64"])
             if "base64" not in result:
     raise RuntimeError(
-        "Apps Script response missing 'base64'. "
+        "Apps Script thiếu trường base64. "
         f"Response keys: {list(result.keys())}; "
-        f"response: {str(result)[:1000]}"
+        f"error: {result.get('error', '')}; "
+        f"response: {str(result)[:400]}"
     )
+
+chunk = base64.b64decode(result["base64"])
 
 chunk = base64.b64decode(result["base64"])
 
