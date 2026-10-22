@@ -92,28 +92,48 @@ def _safe_path(relative_path: str) -> Path:
     return Path(*p.parts)
 
 
-def _download_file(relative_path: str, size: int, local_root: Path) -> None:
-    rel = _safe_path(relative_path)
-    dest = local_root / rel
+def _download_file(relative_path, size, local_root):
+    dest = Path(local_root) / relative_path
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    
+    # Trường hợp file rỗng (0 bytes)
+    if size == 0:
+        dest.touch()
+        print(f"  ✓ Tạo file rỗng {relative_path} (0 B)")
+        return
+
     offset = 0
     with tmp.open("wb") as fh:
         while offset < size:
+            # Gọi API lấy chunk
             result = _call("download_chunk", path=relative_path, offset=offset, chunkSize=CHUNK_BYTES)
-            chunk = base64.b64decode(result["base64"])
-            if "base64" not in result:
-    raise RuntimeError(
-        "Apps Script thiếu trường base64. "
-        f"Response keys: {list(result.keys())}; "
-        f"error: {result.get('error', '')}; "
-        f"response: {str(result)[:400]}"
-    )
+            
+            # 1. Bắt lỗi nếu API trả về chuỗi HTML, string lỗi hoặc không phải dict
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    f"API không trả về định dạng JSON hợp lệ khi tải '{relative_path}'.\n"
+                    f"Nội dung nhận được: {str(result)[:300]}"
+                )
 
-chunk = base64.b64decode(result["base64"])
+            # 2. Bắt lỗi nếu API trả về thông báo lỗi cụ thể (error / message)
+            if "error" in result or "base64" not in result:
+                raise RuntimeError(
+                    f"Không tìm thấy trường 'base64' khi tải '{relative_path}' tại offset {offset}.\n"
+                    f"Dữ liệu API trả về: {result}"
+                )
 
-chunk = base64.b64decode(result["base64"])
+            chunk_str = result.get("base64", "")
+            chunk = base64.b64decode(chunk_str) if chunk_str else b""
 
+            if not chunk and offset < size:
+                raise RuntimeError(f"Nhận chunk rỗng khi tải {relative_path} tại byte {offset} (tổng dung lượng: {size})")
+
+            fh.write(chunk)
+            offset += len(chunk)
+
+    tmp.replace(dest)
+    print(f"  ✓ Tải {relative_path} ({size / (1024 * 1024):.1f} MiB)")
 
 def _download_project_manifest() -> list[dict[str, Any]]:
     response = _call("list_files")
