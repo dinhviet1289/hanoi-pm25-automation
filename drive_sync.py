@@ -104,11 +104,13 @@ def _download_file(relative_path: str, size: int, local_root: Path) -> None:
             chunk = base64.b64decode(result["base64"])
             if "base64" not in result:
     raise RuntimeError(
-        "Apps Script không trả về dữ liệu base64. "
-        f"Phản hồi nhận được: {result}"
+        "Apps Script response missing 'base64'. "
+        f"Response keys: {list(result.keys())}; "
+        f"response: {str(result)[:1000]}"
     )
 
 chunk = base64.b64decode(result["base64"])
+
 
 def _download_project_manifest() -> list[dict[str, Any]]:
     response = _call("list_files")
