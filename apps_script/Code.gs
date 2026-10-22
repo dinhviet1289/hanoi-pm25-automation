@@ -103,11 +103,11 @@ function getDataFolder_() {
   return found;
 }
 
-function allowedFile_(name) {
-  const lower = name.toLowerCase();
-  const skip = [".zip", ".pdf", ".docx", ".xlsx", ".ipynb", ".png", ".jpg", ".jpeg", ".svg", ".gif"];
-  for (let i = 0; i < skip.length; i++) if (lower.endsWith(skip[i])) return false;
-  return true;
+function isBinaryDriveFile_(file) {
+  const mime = String(file.getMimeType() || "");
+  // Bỏ qua toàn bộ Google Sheets, Docs, Slides, Folder... chỉ lấy file vật lý (CSV, JSON, Parquet)
+  if (mime.indexOf("application/vnd.google-apps.") === 0) return false;
+  return allowedFile_(file.getName());
 }
 
 function listProjectFiles_() {
@@ -117,9 +117,20 @@ function listProjectFiles_() {
   while (rootFiles.hasNext()) {
     const file = rootFiles.next();
     const name = file.getName();
-    if (/^(openaq_hanoi_2019_2026_raw( \(1\)|\(1\))?\.csv|open_meteo_hanoi_2019_2026_raw( \(1\)|\(1\))?\.csv|sensor_poll_state\.csv)$/i.test(name) && allowedFile_(name)) {
+    if (/^(openaq_hanoi_2019_2026_raw( \(1\)|\(1\))?\.csv|open_meteo_hanoi_2019_2026_raw( \(1\)|\(1\))?\.csv|sensor_poll_state\.csv)$/i.test(name) && isBinaryDriveFile_(file)) {
       output.push({ path: name, size: file.getSize(), mimeType: file.getMimeType() });
     }
+  }
+  const dirs = root.getFolders();
+  while (dirs.hasNext()) {
+    const dir = dirs.next();
+    if (dir.getName() === "cache_openaq" || dir.getName() === "output_hanoi_pm25") {
+      listTree_(dir, dir.getName(), output, 0);
+    }
+  }
+  return output;
+}
+
   }
   const dirs = root.getFolders();
   while (dirs.hasNext()) {
@@ -136,9 +147,31 @@ function listTree_(folder, prefix, output, depth) {
   const files = folder.getFiles();
   while (files.hasNext()) {
     const file = files.next();
-    if (allowedFile_(file.getName())) {
+    if (isBinaryDriveFile_(file)) {
       output.push({ path: prefix + "/" + file.getName(), size: file.getSize(), mimeType: file.getMimeType() });
     }
+  }
+  const dirs = folder.getFolders();
+  while (dirs.hasNext()) {
+    const dir = dirs.next();
+    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
+  }
+}
+
+  }
+  const dirs = folder.getFolders();
+  while (dirs.hasNext()) {
+    const dir = dirs.next();
+    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
+  }
+}
+  }
+  const dirs = folder.getFolders();
+  while (dirs.hasNext()) {
+    const dir = dirs.next();
+    if (dir.getName() !== ".github_actions_upload_staging") listTree_(dir, prefix + "/" + dir.getName(), output, depth + 1);
+  }
+}
   }
   const dirs = folder.getFolders();
   while (dirs.hasNext()) {
