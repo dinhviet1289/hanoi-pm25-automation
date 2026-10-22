@@ -125,23 +125,26 @@ def _download_project_manifest() -> list[dict[str, Any]]:
 def download_project_state(local_root: Path) -> None:
     local_root.mkdir(parents=True, exist_ok=True)
     files = _download_project_manifest()
-    print(f"-> Tìm thấy {len(files)} file trên Drive.")
+    print(f"-> Tìm thấy {len(files)} file trạng thái/RAW/đầu ra trên Drive.")
     for item in files:
         rel_path = item["path"]
         file_name = Path(rel_path).name
-        
-        # CHỈ TẢI ĐÚNG 2 FILE RAW VÀ SENSOR STATE, BỎ QUA TẤT CẢ CÒN LẠI
-        if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
-            print(f"  [-] Bỏ qua không tải: {rel_path}")
+
+        # Bỏ qua tệp lịch sử quá lớn vượt giới hạn 50MB của Google Apps Script
+        if file_name in {"fact_forecast_long.csv", "fact_forecast_long.csv.tmp"} or Path(rel_path).suffix.lower() in SKIP_SUFFIXES:
+            print(f"  [-] Bỏ qua tải file lớn / không cần thiết: {rel_path}")
             continue
 
         try:
             _download_file(rel_path, int(item.get("size", 0)), local_root)
         except Exception as exc:
-            print(f"  [!] Lỗi tải {rel_path}: {exc}")
-            raise exc
+            # Nếu không phải là file RAW cốt lõi bắt buộc, cho phép bỏ qua kèm cảnh báo
+            if file_name not in RAW_EXPECTED and "sensor_poll_state.csv" not in file_name:
+                print(f"  [!] Cảnh báo: Bỏ qua {rel_path} do lỗi tải: {exc}")
+            else:
+                raise exc
 
-    # Chuẩn hóa tên file có hậu tố (1)
+    # Chuẩn hóa tên file nếu tải từ trình duyệt có hậu tố (1)
     for canonical, aliases in RAW_ALIASES.items():
         destination = local_root / canonical
         if destination.exists():
@@ -151,6 +154,10 @@ def download_project_state(local_root: Path) -> None:
             if candidate.exists():
                 candidate.rename(destination)
                 break
+
+    missing = [name for name in RAW_EXPECTED if not (local_root / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"Thiếu file RAW sau khi tải từ Drive: {missing}")
 def _iter_state_files(local_root: Path):
     for name in sorted(PERSISTENT_ROOT_FILES):
         path = local_root / name
