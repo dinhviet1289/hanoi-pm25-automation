@@ -129,42 +129,41 @@ function walk_(folder, prefix, out) {
 // ---------------------------------------------------------------- download
 // Đọc đúng 1 khoảng byte bằng Drive API (Range) -> không phải nạp cả file vào RAM.
 // LUÔN trả về key "base64" (chuỗi rỗng nếu hết file).
-function downloadChunk_(req) {
-  const file = resolveFile_(req.path);
-  if (!file) throw new Error('Không tìm thấy file: ' + req.path);
- 
-  const size = file.getSize();
-  const offset = Math.max(0, Number(req.offset) || 0);
-  const chunkSize = Math.min(Number(req.chunkSize) || DEFAULT_CHUNK_BYTES, MAX_CHUNK_BYTES);
- 
-  if (offset >= size) return { ok: true, base64: '', offset: offset, length: 0, size: size };
- 
-  const end = Math.min(offset + chunkSize, size) - 1;
-  const headers = authHeader_();
-  headers['Range'] = 'bytes=' + offset + '-' + end;
- 
-  const resp = UrlFetchApp.fetch(
-    DRIVE_FILES_API + file.getId() + '?alt=media&supportsAllDrives=true',
-    { headers: headers, muteHttpExceptions: true }
-  );
-  const code = resp.getResponseCode();
-  let bytes;
-  if (code === 206) {
-    bytes = resp.getContent();
-  } else if (code === 200) {
-    bytes = resp.getContent().slice(offset, end + 1); // server bỏ qua Range
-  } else {
-    throw new Error('Drive API ' + code + ' khi tải ' + req.path + ': ' + resp.getContentText().slice(0, 300));
+function downloadChunk_(p) {
+  var fileId = p.fileId;
+  var offset = parseInt(p.offset || 0, 10);
+  var chunkSize = parseInt(p.chunkSize || 262144, 10);
+  
+  var file = DriveApp.getFileById(fileId);
+  var fileSize = file.getSize();
+  
+  if (offset >= fileSize) {
+    return { ok: true, base64: "" };
   }
-  return {
-    ok: true,
-    base64: Utilities.base64Encode(bytes),
-    offset: offset,
-    length: bytes.length,
-    size: size
-  };
+  
+  var endPos = Math.min(offset + chunkSize, fileSize) - 1;
+  var url = "https://www.googleapis.com/drive/v3/files/" + fileId + "?alt=media";
+  var token = ScriptApp.getOAuthToken();
+  
+  var response = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: {
+      "Authorization": "Bearer " + token,
+      "Range": "bytes=" + offset + "-" + endPos
+    },
+    muteHttpExceptions: true
+  });
+  
+  var responseCode = response.getResponseCode();
+  if (responseCode !== 200 && responseCode !== 206) {
+    throw new Error("Drive API error, status: " + responseCode);
+  }
+  
+  var bytes = response.getContent();
+  var base64 = Utilities.base64Encode(bytes);
+  
+  return { ok: true, base64: base64 };
 }
- 
 // ---------------------------------------------------------------- upload
 // Dùng resumable upload của Drive API: mỗi chunk đẩy thẳng lên Drive,
 // không cần ghép file trong bộ nhớ Apps Script.
