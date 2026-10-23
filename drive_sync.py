@@ -195,8 +195,8 @@ def _iter_state_files(local_root: Path):
         for path in sorted(base.rglob("*")):
             if not path.is_file() or path.suffix.lower() in SKIP_SUFFIXES:
                 continue
-            if "fact_forecast_long" in path.name:
-                print(f"  [-] Bỏ qua upload (tránh ghi đè lịch sử trên Drive): {path.name}")
+            if "fact_forecast_long" in path.name or "observed_hourly" in path.name:
+                print(f"  [-] Bỏ qua upload (tránh ghi đè lịch sử / quá dung lượng Cache Drive): {path.name}")
                 continue
             if path.stat().st_size > MAX_APPS_SCRIPT_FILE_BYTES:
                 print(f"  [-] Bỏ qua upload file quá lớn (>40MB): {path.name}")
