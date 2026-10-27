@@ -3,7 +3,8 @@ name: Hanoi PM2.5 Dashboard Update
 on:
   workflow_dispatch:
   schedule:
-      - cron: "17 */6 * * *"permissions:
+      - cron: "17 */6 * * *"
+      permissions:
   contents: read
 
 jobs:
